@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""Autonomous driving for JetBot using the trained DriverModel.
-
-Runs driver_model.pth against the live camera feed and drives the motors with
-the same arcade-drive mixing as teleoperation.py. Stop with Ctrl+C — or with
-the gamepad button 0 (○) if pygame and a joystick are connected to the JetBot.
-"""
-
 import argparse
 import signal
 import threading
@@ -19,15 +12,22 @@ from torch import nn
 
 from jetbot import Camera, Robot
 
+INPUT_SIZE = 224
+
 
 class DriverModel(nn.Module):
-    # Same architecture as notebooks/driver_model/model_training.py.
+    """Architecture identical to model_training.py.
+
+    fc1 is a concrete Linear(40000, 256) — that's 64 channels * 25 * 25 for a
+    224x224 input, the size LazyLinear materialized to during training.
+    """
+
     def __init__(self):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
-        self.fc1 = nn.LazyLinear(256)
+        self.fc1 = nn.Linear(40000, 256)
         self.fc2 = nn.Linear(256, 2)
 
     def forward(self, x):
@@ -39,137 +39,106 @@ class DriverModel(nn.Module):
         return self.fc2(x)
 
 
-INPUT_SIZE = 224
-
-# Dataset stored forward = controller.axes[1].value (negative when stick is
-# pushed up), turn = controller.axes[0].value. Teleop reads them as
-# raw_y = -axes[1], raw_x = +axes[0] — we replicate that here. Flip these if
-# the robot drives backwards or steers the wrong way on first run.
-FORWARD_SIGN = -1.0
-TURN_SIGN = 1.0
-
-
 def load_model(path, device):
+    model = DriverModel()
     obj = torch.load(path, map_location=device)
-    if isinstance(obj, dict):
-        model = DriverModel()
-        # materialise LazyLinear so its weight tensor exists before load_state_dict
-        with torch.no_grad():
-            model(torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE))
-        model.load_state_dict(obj)
-    else:
-        model = obj
-    return model.to(device).eval()
+    # Accept either a state_dict or a pickled module.
+    model.load_state_dict(obj.state_dict() if isinstance(obj, nn.Module) else obj)
+    model = model.to(device).eval()
+
+    # Warm up (kernels/allocator) so the first real frame isn't slow.
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE, device=device)
+        for _ in range(5):
+            model(dummy)
+    return model
 
 
-def preprocess(frame, device):
-    # Matches model_training.py: BGR->RGB, scale to [0,1], CHW, batch dim.
-    # No mean/std normalisation — training only used transforms.ToTensor().
-    if frame.shape[0] != INPUT_SIZE or frame.shape[1] != INPUT_SIZE:
-        frame = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE))
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame = frame.astype(np.float32) / 255.0
-    return torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).to(device)
+def make_predict(model, device):
+    """Mirror training preprocessing: convert(RGB) + ToTensor() — RGB order,
+    values scaled to [0, 1], no normalization. The camera gives BGR uint8 HWC."""
 
+    @torch.no_grad()
+    def predict(image):
+        if image.shape[0] != INPUT_SIZE or image.shape[1] != INPUT_SIZE:
+            image = cv2.resize(image, (INPUT_SIZE, INPUT_SIZE))
+        tensor = torch.from_numpy(image).to(device)
+        tensor = tensor.permute(2, 0, 1)      # HWC -> CHW
+        tensor = tensor[[2, 1, 0]]            # BGR -> RGB
+        tensor = tensor.float().div_(255.0)   # ToTensor() scaling, no normalization
+        out = model(tensor.unsqueeze(0)).squeeze()
+        return float(out[0]), float(out[1])   # forward, turn
 
-def arcade_mix(y, x, speed_scale, turn_scale):
-    # Identical body to arcade_mix in teleoperation.py.
-    y *= speed_scale
-    x *= turn_scale
-    if x > 0:
-        left = max(-1.0, min(1.0, y))
-        right = max(-1.0, min(1.0, y - x))
-    else:
-        left = max(-1.0, min(1.0, y + x))
-        right = max(-1.0, min(1.0, y))
-    return left, right
-
-
-def try_open_gamepad():
-    try:
-        import pygame
-        pygame.init()
-        pygame.joystick.init()
-        if pygame.joystick.get_count() == 0:
-            return None
-        js = pygame.joystick.Joystick(0)
-        js.init()
-        return js
-    except Exception as e:
-        print(f"Gamepad unavailable ({e})")
-        return None
+    return predict
 
 
 def main():
     here = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--model', default=str(here / 'driver_model.pth'),
                         help='path to the trained .pth')
-    parser.add_argument('--speed-gain', type=float, default=0.15,
-                        help='max forward speed scale')
-    parser.add_argument('--turn-gain', type=float, default=0.15,
-                        help='turn sensitivity scale')
-    parser.add_argument('--no-gamepad', action='store_true',
-                        help='disable pygame gamepad e-stop')
+    parser.add_argument('--speed-gain', type=float, default=0.30,
+                        help='scales predicted forward command into motor speed')
+    parser.add_argument('--turn-gain', type=float, default=1.00,
+                        help='scales predicted turn command into the left/right split')
+    parser.add_argument('--turn-bias', type=float, default=0.0,
+                        help='steady-state correction for motor/camera offset')
+    parser.add_argument('--alpha', type=float, default=0.30,
+                        help='EMA smoothing on turn; lower = smoother but laggier')
+    parser.add_argument('--forward-sign', type=float, default=-1.0, choices=[-1.0, 1.0],
+                        help='polarity of the recorded forward axis (-1 if stick-up was negative)')
+    parser.add_argument('--turn-sign', type=float, default=1.0, choices=[-1.0, 1.0],
+                        help='polarity of the recorded turn axis')
     parser.add_argument('-v', '--verbose', action='store_true',
-                        help='print per-frame inference')
+                        help='print per-frame predictions and motor commands')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-
+    print(f'Loading {args.model} on {device}...')
     model = load_model(args.model, device)
-    print(f"Loaded {args.model}")
+    predict = make_predict(model, device)
+    print('Model ready.')
 
     camera = Camera.instance(width=INPUT_SIZE, height=INPUT_SIZE)
     robot = Robot()
 
     running = threading.Event()
     running.set()
+    state = {'turn': 0.0}
 
-    joystick = None if args.no_gamepad else try_open_gamepad()
-    if joystick is not None:
-        print(f"Gamepad: {joystick.get_name()}  (button 0 / ○ = emergency stop)")
-
-        def gamepad_poll():
-            import pygame
-            while running.is_set():
-                pygame.event.pump()
-                if joystick.get_button(0):
-                    print("Emergency stop (button 0).")
-                    running.clear()
-                    robot.stop()
-                    return
-                time.sleep(0.02)
-
-        threading.Thread(target=gamepad_poll, daemon=True).start()
-
-    @torch.no_grad()
     def on_frame(change):
         if not running.is_set():
             return
-        tensor = preprocess(change['new'], device)
-        out = model(tensor)[0].cpu().numpy()
-        forward, turn = float(out[0]), float(out[1])
-        left, right = arcade_mix(
-            FORWARD_SIGN * forward, TURN_SIGN * turn,
-            args.speed_gain, args.turn_gain,
-        )
+
+        forward_pred, turn_pred = predict(change['new'])
+
+        speed = args.forward_sign * forward_pred * args.speed_gain
+        turn = args.turn_sign * turn_pred * args.turn_gain + args.turn_bias
+
+        state['turn'] = args.alpha * turn + (1.0 - args.alpha) * state['turn']
+
+        # Differential mix: positive turn slows the right wheel (turns right),
+        # matching the data-collection convention.
+        left = float(np.clip(speed + state['turn'], -1.0, 1.0))
+        right = float(np.clip(speed - state['turn'], -1.0, 1.0))
+
         robot.left_motor.value = left
         robot.right_motor.value = right
+
         if args.verbose:
-            print(f"  fwd={forward:+.3f}  turn={turn:+.3f}  "
-                  f"L={left:+.3f}  R={right:+.3f}")
+            print(f'  forward={forward_pred:+.3f} turn={turn_pred:+.3f}  '
+                  f'L={left:+.3f} R={right:+.3f}', end='\r')
 
     def shutdown(signum, _frame):
-        print(f"\nReceived signal {signum}, stopping.")
+        print(f'\nReceived signal {signum}, stopping.')
         running.clear()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    print(f"Driving. speed_gain={args.speed_gain} turn_gain={args.turn_gain}. "
-          f"Ctrl+C to stop.")
+    print(f'Driving. speed_gain={args.speed_gain} turn_gain={args.turn_gain} '
+          f'bias={args.turn_bias}. Ctrl+C to stop.')
     camera.observe(on_frame, names='value')
 
     try:
@@ -180,7 +149,7 @@ def main():
         time.sleep(0.1)
         robot.stop()
         camera.stop()
-        print("Stopped cleanly.")
+        print('Stopped cleanly.')
 
 
 if __name__ == '__main__':
