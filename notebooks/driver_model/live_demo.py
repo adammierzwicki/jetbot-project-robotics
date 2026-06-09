@@ -76,17 +76,17 @@ def main():
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--model', default=str(here / 'driver_model.pth'),
+    parser.add_argument('--model', default=str(here / 'driver_model2.pth'),
                         help='path to the trained .pth')
-    parser.add_argument('--speed-gain', type=float, default=0.30,
+    parser.add_argument('--speed-gain', type=float, default=0.15,
                         help='scales predicted forward command into motor speed')
-    parser.add_argument('--turn-gain', type=float, default=1.00,
+    parser.add_argument('--turn-gain', type=float, default=0.15,
                         help='scales predicted turn command into the left/right split')
     parser.add_argument('--turn-bias', type=float, default=0.0,
                         help='steady-state correction for motor/camera offset')
     parser.add_argument('--alpha', type=float, default=0.30,
                         help='EMA smoothing on turn; lower = smoother but laggier')
-    parser.add_argument('--forward-sign', type=float, default=-1.0, choices=[-1.0, 1.0],
+    parser.add_argument('--forward-sign', type=float, default=1.0, choices=[-1.0, 1.0],
                         help='polarity of the recorded forward axis (-1 if stick-up was negative)')
     parser.add_argument('--turn-sign', type=float, default=1.0, choices=[-1.0, 1.0],
                         help='polarity of the recorded turn axis')
